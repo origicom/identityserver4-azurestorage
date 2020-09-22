@@ -3,7 +3,7 @@
 
 using ElCamino.IdentityServer4.AzureStorage.Helpers;
 using Microsoft.Azure.Cosmos.Table;
-using Microsoft.Azure.Storage.Blob;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System;
@@ -12,6 +12,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Azure;
+using Azure.Storage.Blobs.Models;
 
 namespace ElCamino.IdentityServer4.AzureStorage.Contexts
 {
@@ -19,40 +21,65 @@ namespace ElCamino.IdentityServer4.AzureStorage.Contexts
     {
         protected StorageContext() { }
 
-        public async Task<string> GetBlobContentAsync(string keyNotHashed, CloudBlobContainer container)
+        public async Task<string> GetBlobContentAsync(string keyNotHashed, BlobContainerClient container)
         {
-            CloudBlockBlob blob = container.GetBlockBlobReference(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
+            BlobClient blob = container.GetBlobClient(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
             return await GetBlobContentAsync(blob);
         }
 
-        public async Task<string> GetBlobContentAsync(CloudBlockBlob blob)
+        public async Task<string> GetBlobContentAsync(BlobClient blob)
         {
             try
             {
-                return await blob.DownloadTextAsync();
-            }
-            catch (Microsoft.Azure.Storage.StorageException storageEx)
-            {
-                if (!(storageEx.RequestInformation.ErrorCode == Microsoft.Azure.Storage.Blob.Protocol.BlobErrorCodeStrings.BlobNotFound ))
+                Response<BlobDownloadInfo> download = await blob.DownloadAsync();
+                using (StreamReader sr = new StreamReader(download.Value.Content, Encoding.UTF8))
                 {
-                    throw; 
+                    return await sr.ReadToEndAsync();
                 }
             }
-            
-            return string.Empty;
+            catch (RequestFailedException ex)
+               when (ex.ErrorCode == BlobErrorCode.BlobNotFound)
+            {
+                return string.Empty;
+            }
+
         }
 
-        public async Task<string> UpdateBlobCacheFileAsync<Entity>(IEnumerable<Entity> entities, CloudBlobContainer cacheContainer)
+        public async Task<(string blobName, int count)> UpdateBlobCacheFileAsync<Entity>(IEnumerable<Entity> entities, BlobContainerClient cacheContainer)
         {
             DateTime dateTimeNow = DateTime.UtcNow;
             string blobName = KeyGeneratorHelper.GenerateDateTimeDecendingId(dateTimeNow);
             await SaveBlobAsync(blobName, JsonConvert.SerializeObject(entities), cacheContainer);
-            return blobName;
+            return (blobName, count: entities.Count());
         }
 
-        public async Task<IEnumerable<Entity>> GetLatestFromCacheBlobAsync<Entity>(CloudBlobContainer cacheContainer)
+        public async Task<(string blobName, int count)> UpdateBlobCacheFileAsync<Entity>(IAsyncEnumerable<Entity> entities, BlobContainerClient cacheContainer)
         {
-            CloudBlockBlob blob = await GetFirstBlobAsync(cacheContainer);
+            return await UpdateBlobCacheFileAsync(await entities.ToListAsync(), cacheContainer);
+        }
+
+        /// <summary>
+        /// Deletes all blobs older than the latestBlobName by name comparsion
+        /// </summary>
+        /// <param name="latestBlobName"></param>
+        /// <param name="cacheContainer"></param>
+        /// <returns></returns>
+        public async Task DeleteBlobCacheFilesAsync(string latestBlobName, BlobContainerClient cacheContainer, ILogger logger)
+        {
+            await foreach (BlobItem blobName in cacheContainer.GetBlobsAsync(BlobTraits.None, BlobStates.None))
+            {
+                if (String.Compare(latestBlobName, blobName.Name) == -1)
+                {
+                    BlobClient blobClient = cacheContainer.GetBlobClient(blobName.Name);
+                    await blobClient.DeleteAsync();
+                    logger.LogInformation($"container: {cacheContainer.Name} blob: {blobName.Name} - cache file deleted");
+                }
+            }
+        }
+
+        public async Task<IEnumerable<Entity>> GetLatestFromCacheBlobAsync<Entity>(BlobContainerClient cacheContainer)
+        {
+            BlobClient blob = await GetFirstBlobAsync(cacheContainer);
             if (blob != null)
             {
                 var entities = await GetEntityBlobAsync<List<Entity>>(blob);
@@ -64,19 +91,20 @@ namespace ElCamino.IdentityServer4.AzureStorage.Contexts
             return null;
         }
 
-        public async Task<Entity> GetEntityBlobAsync<Entity>(string keyNotHashed, CloudBlobContainer container) where Entity : class, new()
+        public async Task<Entity> GetEntityBlobAsync<Entity>(string keyNotHashed, BlobContainerClient container) where Entity : class, new()
         {
-            CloudBlockBlob blob = container.GetBlockBlobReference(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
+            BlobClient blob = container.GetBlobClient(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
             return await GetEntityBlobAsync<Entity>(blob);
         }
 
-        public async Task<Entity> GetEntityBlobAsync<Entity>(CloudBlockBlob blobJson) where Entity : class, new()
+        public async Task<Entity> GetEntityBlobAsync<Entity>(BlobClient blobJson) where Entity : class, new()
         {
             try
             {
-                using (Stream s = await blobJson.OpenReadAsync())
+                var download = await blobJson.DownloadAsync();
+                using (Stream s = download.Value.Content)
                 {
-                    using (StreamReader sr = new StreamReader(s))
+                    using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
                     {
                         using (JsonReader reader = new JsonTextReader(sr))
                         {
@@ -86,111 +114,78 @@ namespace ElCamino.IdentityServer4.AzureStorage.Contexts
                     }
                 }
             }
-            catch (Microsoft.Azure.Storage.StorageException storageEx)
+            catch (RequestFailedException ex)
+               when (ex.ErrorCode == BlobErrorCode.BlobNotFound)
             {
-                if (!(storageEx.RequestInformation.ErrorCode == Microsoft.Azure.Storage.Blob.Protocol.BlobErrorCodeStrings.BlobNotFound))
+                return null;
+            }
+        }
+
+        public async IAsyncEnumerable<Entity> GetAllBlobEntitiesAsync<Entity>(BlobContainerClient container, ILogger logger) where Entity : class, new()
+        {
+            await foreach(var blobJson in GetAllBlobsAsync(container))
+            {
+                yield return await GetEntityBlobAsync<Entity>(blobJson);
+            }
+        }
+       
+
+        public async IAsyncEnumerable<BlobClient> GetAllBlobsAsync(BlobContainerClient container)
+        {
+            AsyncPageable<BlobItem> pageable = container.GetBlobsAsync(BlobTraits.None, BlobStates.None, string.Empty);
+            IAsyncEnumerable<Page<BlobItem>> pages = pageable.AsPages();
+            await foreach (Page<BlobItem> page in pages)
+            {
+                foreach(BlobItem blob in page.Values)
                 {
-                    throw;
+                    yield return container.GetBlobClient(blob.Name);
                 }
             }
-            return null;
         }
 
-        public async Task<IEnumerable<Entity>> GetAllBlobEntitiesAsync<Entity>(CloudBlobContainer container, ILogger logger) where Entity : class, new()
+        public async Task<BlobClient> GetFirstBlobAsync(BlobContainerClient container)
         {
+            AsyncPageable<BlobItem> pageable = container.GetBlobsAsync(BlobTraits.None, BlobStates.None, string.Empty);
+            IAsyncEnumerable<Page<BlobItem>> pages = pageable.AsPages(pageSizeHint:1);
 
-            var entityTasks = (await GetAllBlobsAsync(container).ConfigureAwait(false))
-                .Select(blobJson =>
-                {
-                    return GetEntityBlobAsync<Entity>(blobJson);
-                }).ToArray(); //.ToArray actually speeds up the task processing
-
-
-            await Task.WhenAll(entityTasks);
-            return entityTasks.Where(w => w?.Result != null).Select(s => s.Result);
-        }
-
-        public Task<IEnumerable<CloudBlockBlob>> GetAllBlobsAsync(CloudBlobContainer container)
-        {
-            return Task.Run<IEnumerable<CloudBlockBlob>>(() => GetAllBlobs(container));
-        }
-
-        public IEnumerable<CloudBlockBlob> GetAllBlobs(CloudBlobContainer container)
-        {
-            BlobContinuationToken token = new BlobContinuationToken();
-            while (token != null)
+            await foreach(Page<BlobItem> page in pages)
             {
-                var blobSegment = container.ListBlobsSegmented(string.Empty, true, 
-                    BlobListingDetails.None, 100, 
-                    token, 
-                    new BlobRequestOptions() , 
-                    new Microsoft.Azure.Storage.OperationContext() );
-
-                foreach (var blobItem in blobSegment.Results)
+                BlobItem blob = page?.Values?.FirstOrDefault();
+                if (blob != null)
                 {
-                    CloudBlockBlob blockBlob = blobItem as CloudBlockBlob;
-                    if (blockBlob != null)
-                    {
-                        yield return blockBlob;
-                    }
+                    return container.GetBlobClient(blob.Name);
                 }
-                token = blobSegment.ContinuationToken;
+                break;
             }
-        }
-
-        public async Task<CloudBlockBlob> GetFirstBlobAsync(CloudBlobContainer container)
-        {
-            BlobContinuationToken token = new BlobContinuationToken();
-            var blobSegment = await container.ListBlobsSegmentedAsync(string.Empty, true,
-                BlobListingDetails.None, 1,
-                token,
-                new BlobRequestOptions(),
-                new Microsoft.Azure.Storage.OperationContext());
-
-            CloudBlockBlob blockBlob = blobSegment.Results.FirstOrDefault() as CloudBlockBlob;
-            if (blockBlob != null)
-            {
-                return blockBlob;
-            }
+            
             return null;
-        }
+        }       
 
-        public async Task DeleteBlobAsync(string keyNotHashed, CloudBlobContainer container)
+        public async Task DeleteBlobAsync(string keyNotHashed, BlobContainerClient container)
         {
-            CloudBlockBlob blob = container.GetBlockBlobReference(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
+            BlobClient blob = container.GetBlobClient(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
             await blob.DeleteIfExistsAsync();
         }
 
-        public async Task SaveBlobWithHashedKeyAsync(string keyNotHashed, string jsonEntityContent, CloudBlobContainer container)
+        public async Task SaveBlobWithHashedKeyAsync(string keyNotHashed, string jsonEntityContent, BlobContainerClient container)
         {
-            CloudBlockBlob blob = container.GetBlockBlobReference(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
-            blob.Properties.ContentType = "application/json";
+            BlobClient blob = container.GetBlobClient(KeyGeneratorHelper.GenerateHashValue(keyNotHashed));
 
-            await blob.UploadTextAsync(jsonEntityContent,
-                Encoding.UTF8,
-                Microsoft.Azure.Storage.AccessCondition.GenerateEmptyCondition(),
-                new BlobRequestOptions() { },
-                new Microsoft.Azure.Storage.OperationContext() { },
-                new System.Threading.CancellationToken());
-            await blob.SetPropertiesAsync();
+            await blob.UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(jsonEntityContent)), new BlobHttpHeaders() 
+            { 
+                ContentType = "application/json"
+            });
         }
 
-        public async Task SaveBlobAsync(string blobName, string jsonEntityContent, CloudBlobContainer container)
+        public async Task SaveBlobAsync(string blobName, string jsonEntityContent, BlobContainerClient container)
         {
-            CloudBlockBlob blob = container.GetBlockBlobReference(blobName);
-            blob.Properties.ContentType = "application/json";
-
-            await blob.UploadTextAsync(jsonEntityContent,
-                Encoding.UTF8,
-                Microsoft.Azure.Storage.AccessCondition.GenerateEmptyCondition(),
-                new BlobRequestOptions() { },
-                new Microsoft.Azure.Storage.OperationContext() { },
-                new System.Threading.CancellationToken());
-            await blob.SetPropertiesAsync();
+            BlobClient blob = container.GetBlobClient(blobName);
+            await blob.UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(jsonEntityContent)), new BlobHttpHeaders()
+            {
+                ContentType = "application/json"
+            });
         }
-
        
-
         /// <summary>
         /// Get table entity where the partition and row key are the hash of the entity key provided
         /// </summary>

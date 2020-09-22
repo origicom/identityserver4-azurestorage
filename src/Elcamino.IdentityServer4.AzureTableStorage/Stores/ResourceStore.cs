@@ -9,7 +9,7 @@ using ElCamino.IdentityServer4.AzureStorage.Mappers;
 using IdentityServer4.Models;
 using IdentityServer4.Stores;
 using Microsoft.Azure.Cosmos.Table;
-using Microsoft.Azure.Storage.Blob;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System;
@@ -166,15 +166,15 @@ namespace ElCamino.IdentityServer4.AzureStorage.Stores
         public async Task UpdateApiResourceCacheFileAsync(IEnumerable<Entities.ApiResource> entities)
         {
             DateTime dateTimeNow = DateTime.UtcNow;
-            string blobName = await StorageContext.UpdateBlobCacheFileAsync<Entities.ApiResource>(entities, StorageContext.ApiResourceBlobCacheContainer);
-            _logger.LogInformation($"{nameof(UpdateApiResourceCacheFileAsync)} client count {entities.Count()} saved in blob storage: {blobName}");
+            (string blobName, int count) = await StorageContext.UpdateBlobCacheFileAsync<Entities.ApiResource>(entities, StorageContext.ApiResourceBlobCacheContainer);
+            _logger.LogInformation($"{nameof(UpdateApiResourceCacheFileAsync)} client count {count} saved in blob storage: {blobName}");
         }
 
         public async Task UpdateIdentityResourceCacheFileAsync(IEnumerable<Entities.IdentityResource> entities)
         {
             DateTime dateTimeNow = DateTime.UtcNow;
-            string blobName = await StorageContext.UpdateBlobCacheFileAsync<Entities.IdentityResource>(entities, StorageContext.IdentityResourceBlobCacheContainer);
-            _logger.LogInformation($"{nameof(UpdateIdentityResourceCacheFileAsync)} client count {entities.Count()} saved in blob storage: {blobName}");
+            (string blobName, int count) = await StorageContext.UpdateBlobCacheFileAsync<Entities.IdentityResource>(entities, StorageContext.IdentityResourceBlobCacheContainer);
+            _logger.LogInformation($"{nameof(UpdateIdentityResourceCacheFileAsync)} client count {count} saved in blob storage: {blobName}");
         }
 
         public async Task<IEnumerable<Entities.ApiResource>> GetLatestApiResourceCacheAsync()
@@ -261,7 +261,7 @@ namespace ElCamino.IdentityServer4.AzureStorage.Stores
             return entities.Select(s => s?.ToModel());
         }
 
-        private async Task<IEnumerable<Entity>> GetResourcesByScopeAsync<Entity>(IEnumerable<string> scopeNames, CloudTable table, CloudBlobContainer container) where Entity : class, new()
+        private async Task<IEnumerable<Entity>> GetResourcesByScopeAsync<Entity>(IEnumerable<string> scopeNames, CloudTable table, BlobContainerClient container) where Entity : class, new()
         {
             var scopeTasks = scopeNames.Distinct().Select(scope => GetResourceScopeIndexTblEntitiesAsync(scope, table));
 
@@ -332,7 +332,7 @@ namespace ElCamino.IdentityServer4.AzureStorage.Stores
             var entities = await GetLatestApiResourceCacheAsync();
             if (entities == null)
             {
-                entities = await StorageContext.GetAllBlobEntitiesAsync<Entities.ApiResource>(StorageContext.ApiResourceBlobContainer, _logger);
+                entities = await StorageContext.GetAllBlobEntitiesAsync<Entities.ApiResource>(StorageContext.ApiResourceBlobContainer, _logger).ToListAsync();
                 await UpdateApiResourceCacheFileAsync(entities);
             }
 
@@ -344,7 +344,7 @@ namespace ElCamino.IdentityServer4.AzureStorage.Stores
             var entities = await GetLatestIdentityResourceCacheAsync();
             if (entities == null)
             {
-                entities = await StorageContext.GetAllBlobEntitiesAsync<Entities.IdentityResource>(StorageContext.IdentityResourceBlobContainer, _logger);
+                entities = await StorageContext.GetAllBlobEntitiesAsync<Entities.IdentityResource>(StorageContext.IdentityResourceBlobContainer, _logger).ToListAsync();
                 await UpdateIdentityResourceCacheFileAsync(entities);
             }
 
